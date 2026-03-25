@@ -1,0 +1,242 @@
+name: Runtime Error → Copilot Auto-Fix
+
+# Triggered by a repository_dispatch event of type "runtime_error".
+# External services (Rollbar, Datadog, etc.) post this event via the
+# GitHub API:  POST /repos/{owner}/{repo}/dispatches
+on:
+  repository_dispatch:
+    types: [runtime_error]
+
+jobs:
+  create-fix-issue:
+    runs-on: ubuntu-latest
+    # This job uses COPILOT_DISPATCH_PAT for all GitHub API calls.
+    # The default GITHUB_TOKEN is not needed, so all permissions are revoked.
+    permissions: {}
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. Validate that the required payload fields are present before
+      #    doing any further work.
+      # ---------------------------------------------------------------
+      - name: Validate payload
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          missing=()
+
+          for field in title stack_trace error_message target_repo; do
+            value=$(echo "$PAYLOAD" | jq -r --arg f "$field" '.[$f] // empty')
+            if [ -z "$value" ]; then
+              missing+=("$field")
+            fi
+          done
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required payload fields: ${missing[*]}"
+            exit 1
+          fi
+
+          echo "✅ Payload validation passed."
+
+      # ---------------------------------------------------------------
+      # 2. Parse the payload and write each field to GITHUB_OUTPUT so
+      #    later steps can reference them with steps.parse.outputs.<name>.
+      # ---------------------------------------------------------------
+      - name: Parse error payload
+        id: parse
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          TITLE=$(echo "$PAYLOAD"        | jq -r '.title')
+          STACK_TRACE=$(echo "$PAYLOAD"  | jq -r '.stack_trace')
+          ERROR_MSG=$(echo "$PAYLOAD"    | jq -r '.error_message')
+          ENVIRONMENT=$(echo "$PAYLOAD"  | jq -r '.environment  // "unknown"')
+          SEVERITY=$(echo "$PAYLOAD"     | jq -r '.severity     // "error"')
+          ERROR_URL=$(echo "$PAYLOAD"    | jq -r '.error_url    // "N/A"')
+          TARGET_REPO=$(echo "$PAYLOAD"  | jq -r '.target_repo')
+          BASE_BRANCH=$(echo "$PAYLOAD"  | jq -r '.base_branch  // "main"')
+
+          # Use heredoc-style delimiters to safely handle multiline values.
+          {
+            printf 'title<<__TITLE__\n%s\n__TITLE__\n'       "$TITLE"
+            printf 'stack_trace<<__STACK__\n%s\n__STACK__\n' "$STACK_TRACE"
+            printf 'error_message<<__MSG__\n%s\n__MSG__\n'   "$ERROR_MSG"
+            printf 'environment=%s\n'  "$ENVIRONMENT"
+            printf 'severity=%s\n'     "$SEVERITY"
+            printf 'error_url=%s\n'    "$ERROR_URL"
+            printf 'target_repo=%s\n'  "$TARGET_REPO"
+            printf 'base_branch=%s\n'  "$BASE_BRANCH"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 3. Check for an existing open issue on the *target* repo that
+      #    already contains the same error message to avoid duplicates.
+      # ---------------------------------------------------------------
+      - name: Check for duplicate issues
+        id: dedup
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_DISPATCH_PAT }}
+          TARGET_REPO: ${{ steps.parse.outputs.target_repo }}
+          ERROR_MSG: ${{ steps.parse.outputs.error_message }}
+        run: |
+          # Sanitize the error message for the search query: strip characters
+          # that GitHub search treats specially (quotes, colons, parens, etc.)
+          # and cap at 100 chars to stay within query length limits.
+          SAFE_MSG=$(echo "$ERROR_MSG" \
+            | tr -d '"\\' \
+            | tr ":'()" "    " \
+            | cut -c1-100)
+
+          # Search for open issues whose title contains the sanitized message.
+          SEARCH_QUERY="repo:${TARGET_REPO} is:issue is:open in:title ${SAFE_MSG}"
+
+          COUNT=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --method GET \
+            "search/issues" \
+            --field "q=${SEARCH_QUERY}" \
+            --jq '.total_count')
+
+          if [ "$COUNT" -gt 0 ]; then
+            echo "⚠️  Found $COUNT existing open issue(s) for this error — skipping duplicate creation."
+            echo "duplicate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ No duplicate found — proceeding to create issue."
+            echo "duplicate=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------------------------------------------------------------
+      # 4. Build the formatted issue body and write it to GITHUB_OUTPUT.
+      # ---------------------------------------------------------------
+      - name: Build issue body
+        id: body
+        if: steps.dedup.outputs.duplicate == 'false'
+        env:
+          STACK_TRACE: ${{ steps.parse.outputs.stack_trace }}
+          ERROR_MSG: ${{ steps.parse.outputs.error_message }}
+          ENVIRONMENT: ${{ steps.parse.outputs.environment }}
+          SEVERITY: ${{ steps.parse.outputs.severity }}
+          ERROR_URL: ${{ steps.parse.outputs.error_url }}
+        run: |
+          # Build the body using printf to avoid heredoc terminators at
+          # column 1, which would break YAML literal block parsing.
+          BODY_FILE=$(mktemp)
+
+          printf '## Runtime Error Detected\n\n' >> "$BODY_FILE"
+          printf '| Field | Value |\n' >> "$BODY_FILE"
+          printf '|---|---|\n' >> "$BODY_FILE"
+          printf '| **Environment** | %s |\n' "$ENVIRONMENT" >> "$BODY_FILE"
+          printf '| **Severity** | %s |\n' "$SEVERITY" >> "$BODY_FILE"
+          printf '| **Error Tracking URL** | %s |\n\n' "$ERROR_URL" >> "$BODY_FILE"
+          printf '### Error Message\n\n```\n%s\n```\n\n' "$ERROR_MSG" >> "$BODY_FILE"
+          printf '### Stack Trace\n\n```python\n%s\n```\n\n' "$STACK_TRACE" >> "$BODY_FILE"
+          printf -- '---\n\n' >> "$BODY_FILE"
+          printf '### Instructions for Copilot Agent\n\n' >> "$BODY_FILE"
+          printf '1. Analyze the stack trace above and locate the affected code in this repository.\n' >> "$BODY_FILE"
+          printf '2. Identify the root cause of the error.\n' >> "$BODY_FILE"
+          printf '3. Implement a fix with appropriate error handling, null checks, or input validation.\n' >> "$BODY_FILE"
+          printf '4. Add or update tests to cover the failure case and prevent regression.\n' >> "$BODY_FILE"
+          printf '5. Ensure all existing tests continue to pass.\n' >> "$BODY_FILE"
+
+          {
+            echo "body<<__BODY__"
+            cat "$BODY_FILE"
+            echo "__BODY__"
+          } >> "$GITHUB_OUTPUT"
+
+          rm -f "$BODY_FILE"
+
+      # ---------------------------------------------------------------
+      # 5. Create the issue on the target repo, assigned to the Copilot
+      #    coding agent, with the required labels.
+      # ---------------------------------------------------------------
+      - name: Create issue and assign to Copilot coding agent
+        id: create_issue
+        if: steps.dedup.outputs.duplicate == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_DISPATCH_PAT }}
+          TARGET_REPO: ${{ steps.parse.outputs.target_repo }}
+          BASE_BRANCH: ${{ steps.parse.outputs.base_branch }}
+          ISSUE_TITLE: "[Auto] ${{ steps.parse.outputs.title }}"
+          ISSUE_BODY: ${{ steps.body.outputs.body }}
+        run: |
+          # Ensure the required labels exist on the target repo before
+          # creating the issue (idempotent — safe to run every time).
+          for label in bug automated copilot-fix; do
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${TARGET_REPO}/labels" \
+              --field "name=${label}" \
+              --field "color=d73a4a" \
+              2>/dev/null || true   # ignore "already exists" errors
+          done
+
+          RESPONSE=$(gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${TARGET_REPO}/issues" \
+            --field "title=${ISSUE_TITLE}" \
+            --field "body=${ISSUE_BODY}" \
+            --field "labels[]=bug" \
+            --field "labels[]=automated" \
+            --field "labels[]=copilot-fix" \
+            --field "assignees[]=copilot-swe-agent[bot]" \
+            --field "agent_assignment[target_repo]=${TARGET_REPO}" \
+            --field "agent_assignment[base_branch]=${BASE_BRANCH}")
+
+          ISSUE_URL=$(echo "$RESPONSE" | jq -r '.html_url')
+          ISSUE_NUMBER=$(echo "$RESPONSE" | jq -r '.number')
+
+          echo "✅ Issue created: $ISSUE_URL"
+          echo "issue_url=$ISSUE_URL"        >> "$GITHUB_OUTPUT"
+          echo "issue_number=$ISSUE_NUMBER"  >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 6. Write a human-readable summary to the Actions step summary.
+      # ---------------------------------------------------------------
+      - name: Write step summary
+        if: steps.dedup.outputs.duplicate == 'false'
+        env:
+          ISSUE_URL: ${{ steps.create_issue.outputs.issue_url }}
+          ISSUE_NUMBER: ${{ steps.create_issue.outputs.issue_number }}
+          TARGET_REPO: ${{ steps.parse.outputs.target_repo }}
+          SEVERITY: ${{ steps.parse.outputs.severity }}
+          ENVIRONMENT: ${{ steps.parse.outputs.environment }}
+          TITLE: ${{ steps.parse.outputs.title }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY_EOF
+          ## ✅ Copilot Fix Issue Created
+
+          | Field         | Value |
+          |---------------|-------|
+          | **Issue**     | [#${ISSUE_NUMBER} — ${TITLE}](${ISSUE_URL}) |
+          | **Repo**      | \`${TARGET_REPO}\` |
+          | **Severity**  | ${SEVERITY} |
+          | **Environment** | ${ENVIRONMENT} |
+
+          The Copilot coding agent has been assigned and will analyze the stack
+          trace, locate the root cause, and open a pull request with a proposed fix.
+          SUMMARY_EOF
+
+      # ---------------------------------------------------------------
+      # 7. Report skipped-duplicate to the summary so operators know.
+      # ---------------------------------------------------------------
+      - name: Write duplicate-skip summary
+        if: steps.dedup.outputs.duplicate == 'true'
+        env:
+          TARGET_REPO: ${{ steps.parse.outputs.target_repo }}
+          ERROR_MSG: ${{ steps.parse.outputs.error_message }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY_EOF
+          ## ⚠️ Duplicate Issue Detected — Skipped
+
+          An open issue for the error below already exists on \`${TARGET_REPO}\`.
+          No new issue was created to avoid duplicates.
+
+          **Error:** \`${ERROR_MSG}\`
+          SUMMARY_EOF
